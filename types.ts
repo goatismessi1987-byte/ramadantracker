@@ -35,4 +35,7 @@ export interface RamadanSchedule {
   date: string;
   seheri: string;
   iftar: string;
+  // Added raw Date objects to facilitate countdown and timezone calculations
+  seheriRaw: Date;
+  iftarRaw: Date;
 }
