@@ -5,15 +5,7 @@ import MotivationalSection from './components/MotivationalSection';
 import DayCard from './components/DayCard';
 import { DayRecord, UserProfile } from './types';
 import { generateInitialRecords, RAMADAN_SCHEDULE, RAMADAN_START_DATE } from './constants';
-import { db } from './firebase';
-import { 
-  collection, 
-  onSnapshot, 
-  doc, 
-  setDoc, 
-  updateDoc, 
-  query 
-} from "firebase/firestore";
+import { supabase } from './supabase';
 import { 
   Calendar, 
   Users, 
@@ -36,10 +28,7 @@ const App: React.FC = () => {
   const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
   const [isSyncing, setIsSyncing] = useState(true);
   
-  const [currentUser, setCurrentUser] = useState<UserProfile | null>(() => {
-    const savedId = localStorage.getItem('ramadan_current_user_id');
-    return null; // Start null, will resolve from Firestore
-  });
+  const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
   
   // Auth state
   const [authMode, setAuthMode] = useState<'login' | 'register'>('register');
@@ -53,28 +42,61 @@ const App: React.FC = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [locationOffset, setLocationOffset] = useState(0);
 
-  // 1. Real-time sync with Firestore
+  // 1. Initial Load and Real-time Subscription via Supabase
   useEffect(() => {
-    const q = query(collection(db, "users"));
-    const unsubscribe = onSnapshot(q, (querySnapshot) => {
-      const users: UserProfile[] = [];
-      querySnapshot.forEach((doc) => {
-        users.push(doc.data() as UserProfile);
-      });
-      setAllUsers(users);
-      setIsSyncing(false);
+    const fetchInitialData = async () => {
+      const { data, error } = await supabase
+        .from('users')
+        .select('*');
       
-      // Keep currentUser in sync with the latest global data
-      const savedId = localStorage.getItem('ramadan_current_user_id');
-      if (savedId) {
-        const matchingUser = users.find(u => u.id === savedId);
-        if (matchingUser) {
-          setCurrentUser(matchingUser);
+      if (!error && data) {
+        setAllUsers(data as UserProfile[]);
+        
+        // Resolve Current User if ID exists in localStorage
+        const savedId = localStorage.getItem('ramadan_current_user_id');
+        if (savedId) {
+          const matchingUser = (data as UserProfile[]).find(u => u.id === savedId);
+          if (matchingUser) setCurrentUser(matchingUser);
         }
       }
-    });
+      setIsSyncing(false);
+    };
 
-    return () => unsubscribe();
+    fetchInitialData();
+
+    // Subscribe to changes
+    const channel = supabase
+      .channel('schema-db-changes')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'users'
+        },
+        (payload) => {
+          setAllUsers((prev) => {
+            if (payload.eventType === 'INSERT') {
+              return [...prev, payload.new as UserProfile];
+            } else if (payload.eventType === 'UPDATE') {
+              const updated = payload.new as UserProfile;
+              // Sync current user state if they are the one being updated
+              if (localStorage.getItem('ramadan_current_user_id') === updated.id) {
+                setCurrentUser(updated);
+              }
+              return prev.map(u => u.id === updated.id ? updated : u);
+            } else if (payload.eventType === 'DELETE') {
+              return prev.filter(u => u.id === payload.old.id);
+            }
+            return prev;
+          });
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, []);
 
   // Clock & Countdown Timer
@@ -83,7 +105,7 @@ const App: React.FC = () => {
     return () => clearInterval(timer);
   }, []);
 
-  // Reminder Logic: Notify at 11:30 PM (23:30)
+  // Reminder Logic
   useEffect(() => {
     const checkReminder = () => {
       const now = new Date();
@@ -104,7 +126,7 @@ const App: React.FC = () => {
     sessionStorage.setItem(`dismissed_reminder_${new Date().toDateString()}`, 'true');
   };
 
-  // Geolocation for local timing adjustment
+  // Geolocation
   useEffect(() => {
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition((position) => {
@@ -112,9 +134,7 @@ const App: React.FC = () => {
         const baseLng = 91.78; // Chittagong
         const offset = Math.round((longitude - baseLng) * 4);
         setLocationOffset(offset);
-      }, (err) => {
-        console.warn("Geolocation access denied.", err);
-      });
+      }, (err) => console.warn(err));
     }
   }, []);
 
@@ -127,48 +147,30 @@ const App: React.FC = () => {
   const countdownInfo = useMemo(() => {
     const todaySchedule = RAMADAN_SCHEDULE[currentRamadanDay - 1];
     if (!todaySchedule) return null;
-
     const seheriTime = new Date(todaySchedule.seheriRaw);
     seheriTime.setMinutes(seheriTime.getMinutes() + locationOffset);
     const iftarTime = new Date(todaySchedule.iftarRaw);
     iftarTime.setMinutes(iftarTime.getMinutes() + locationOffset);
-
     const now = new Date();
     const todaySeheri = new Date(now);
     todaySeheri.setHours(seheriTime.getHours(), seheriTime.getMinutes(), 0);
     const todayIftar = new Date(now);
     todayIftar.setHours(iftarTime.getHours(), iftarTime.getMinutes(), 0);
-
-    let target: Date;
-    let label: string;
-
-    if (now < todaySeheri) {
-      target = todaySeheri;
-      label = "Seheri Ends In";
-    } else if (now < todayIftar) {
-      target = todayIftar;
-      label = "Iftar Starts In";
-    } else {
+    let target: Date, label: string;
+    if (now < todaySeheri) { target = todaySeheri; label = "Seheri Ends In"; }
+    else if (now < todayIftar) { target = todayIftar; label = "Iftar Starts In"; }
+    else {
       const tomorrowSchedule = RAMADAN_SCHEDULE[currentRamadanDay];
       if (tomorrowSchedule) {
         const tomSeheri = new Date(tomorrowSchedule.seheriRaw);
         tomSeheri.setMinutes(tomSeheri.getMinutes() + locationOffset);
-        target = new Date(now);
-        target.setDate(target.getDate() + 1);
+        target = new Date(now); target.setDate(target.getDate() + 1);
         target.setHours(tomSeheri.getHours(), tomSeheri.getMinutes(), 0);
         label = "Next Seheri In";
       } else return null;
     }
-
     const diff = target.getTime() - now.getTime();
-    return { 
-      label, 
-      h: Math.floor(diff / (1000 * 60 * 60)), 
-      m: Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60)), 
-      s: Math.floor((diff % (1000 * 60)) / 1000),
-      seheri: todaySeheri, 
-      iftar: todayIftar 
-    };
+    return { label, h: Math.floor(diff / (1000 * 60 * 60)), m: Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60)), s: Math.floor((diff % (1000 * 60)) / 1000), seheri: todaySeheri, iftar: todayIftar };
   }, [currentRamadanDay, currentTime, locationOffset]);
 
   const handleCreateProfile = async (e: React.FormEvent) => {
@@ -178,7 +180,6 @@ const App: React.FC = () => {
       setLoginError('This name is already taken.');
       return;
     }
-
     const newId = crypto.randomUUID();
     const newUser: UserProfile = {
       id: newId,
@@ -187,22 +188,19 @@ const App: React.FC = () => {
       isCurrentUser: true,
       records: generateInitialRecords(),
     };
-
-    try {
-      await setDoc(doc(db, "users", newId), newUser);
+    const { error } = await supabase.from('users').insert([newUser]);
+    if (error) {
+      setLoginError('Cloud registration failed.');
+    } else {
       setCurrentUser(newUser);
       localStorage.setItem('ramadan_current_user_id', newId);
-      setNameInput(''); setPasswordInput(''); setLoginError('');
-    } catch (err) {
-      setLoginError('Failed to save profile to cloud.');
+      setNameInput(''); setPasswordInput('');
     }
   };
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
-    const user = allUsers.find(u => 
-      u.name.toLowerCase() === nameInput.toLowerCase() && u.password === passwordInput
-    );
+    const user = allUsers.find(u => u.name.toLowerCase() === nameInput.toLowerCase() && u.password === passwordInput);
     if (user) {
       setCurrentUser(user);
       localStorage.setItem('ramadan_current_user_id', user.id);
@@ -213,54 +211,36 @@ const App: React.FC = () => {
   };
 
   const handleLogout = () => {
-    setCurrentUser(null);
-    setViewingUser(null);
-    setActiveTab('dashboard');
+    setCurrentUser(null); setViewingUser(null); setActiveTab('dashboard');
     localStorage.removeItem('ramadan_current_user_id');
   };
 
   const updateRecord = async (updatedRecord: DayRecord) => {
     if (!currentUser) return;
-    
-    const updatedRecords = currentUser.records.map(r => 
-      r.day === updatedRecord.day ? updatedRecord : r
-    );
-
-    // Optimistically update UI
+    const updatedRecords = currentUser.records.map(r => r.day === updatedRecord.day ? updatedRecord : r);
+    // Optimistic update
     setCurrentUser({ ...currentUser, records: updatedRecords });
-
-    try {
-      const userRef = doc(db, "users", currentUser.id);
-      await updateDoc(userRef, {
-        records: updatedRecords
-      });
-    } catch (err) {
-      console.error("Cloud sync failed:", err);
-    }
+    const { error } = await supabase
+      .from('users')
+      .update({ records: updatedRecords })
+      .eq('id', currentUser.id);
+    if (error) console.error("Supabase sync failed:", error);
   };
 
   const calculateStats = (user: UserProfile) => {
     const totalFastings = user.records.filter(r => r.fasting).length;
     const totalPages = user.records.reduce((acc, r) => acc + r.quranPages, 0);
     const totalPrayers = user.records.reduce((acc, r) => acc + Object.values(r.salah).filter(v => v).length, 0);
-    
-    const lastDayWithActivity = [...user.records].reverse().find(r => 
-      r.fasting || Object.values(r.salah).some(v => v) || r.quranPages > 0
-    )?.day || 0;
-
+    const lastDayWithActivity = [...user.records].reverse().find(r => r.fasting || Object.values(r.salah).some(v => v) || r.quranPages > 0)?.day || 0;
     const activePeriod = Math.max(currentRamadanDay, lastDayWithActivity);
     const relevantRecords = user.records.slice(0, activePeriod);
     const totalDailyPercentagesSum = relevantRecords.reduce((acc, r) => {
       const prayersDone = Object.values(r.salah).filter(v => v).length;
       const quranWeight = Math.min(r.quranPages, 20);
-      const dayPercent = (r.fasting ? 40 : 0) + (prayersDone * 8) + quranWeight;
-      return acc + dayPercent;
+      return acc + ((r.fasting ? 40 : 0) + (prayersDone * 8) + quranWeight);
     }, 0);
-
     const divisor = relevantRecords.length || 1;
-    const overallProgress = Math.round(totalDailyPercentagesSum / divisor);
-
-    return { totalFastings, totalPages, totalPrayers, overallProgress };
+    return { totalFastings, totalPages, totalPrayers, overallProgress: Math.round(totalDailyPercentagesSum / divisor) };
   };
 
   const sortedUsers = useMemo(() => {
@@ -291,7 +271,7 @@ const App: React.FC = () => {
         <div className="flex flex-col items-center gap-4 py-8 border-t border-emerald-900/50 w-full max-w-md">
            <img src="https://placehold.co/120x120/022c22/fbbf24?text=AG&font=serif" alt="Atongko Group Logo" className="w-20 h-20 object-contain drop-shadow-[0_0_10px_rgba(251,191,36,0.3)] opacity-80" />
            <div className="text-center">
-             <p className="text-emerald-500 text-xs uppercase tracking-widest font-bold">Cloud Sync Active</p>
+             <p className="text-emerald-500 text-xs uppercase tracking-widest font-bold">Supabase Global Sync</p>
              <p className="text-amber-400 font-bold text-lg">Powered by Atongko Group</p>
            </div>
         </div>
@@ -307,11 +287,9 @@ const App: React.FC = () => {
         <div className="fixed top-6 left-1/2 -translate-x-1/2 z-[60] w-[90%] max-w-lg animate-in fade-in slide-in-from-top-10 duration-500">
           <div className="bg-gradient-to-r from-amber-600 to-amber-500 text-emerald-950 p-4 sm:p-5 rounded-3xl flex items-center justify-between gap-4 shadow-[0_20px_50px_-12px_rgba(251,191,36,0.5)] border-2 border-emerald-900/20">
             <div className="flex items-center gap-3">
-              <div className="bg-emerald-950 text-amber-500 p-2 rounded-2xl animate-bounce">
-                <BellRing size={24} />
-              </div>
+              <div className="bg-emerald-950 text-amber-500 p-2 rounded-2xl animate-bounce"><BellRing size={24} /></div>
               <div className="flex flex-col">
-                <span className="text-[10px] font-black uppercase tracking-[0.2em] opacity-80">Daily Reminder (11:30 PM)</span>
+                <span className="text-[10px] font-black uppercase tracking-[0.2em] opacity-80">Daily Reminder</span>
                 <p className="text-sm sm:text-base font-bold leading-tight">আজকের আমলনামা কি পূর্ণ করেছেন? আপনার রিপোর্ট সাবমিট করুন।</p>
               </div>
             </div>
@@ -328,7 +306,7 @@ const App: React.FC = () => {
             <div className="flex items-center gap-2">
                <div className="flex items-center gap-1 text-[10px] text-emerald-500 font-bold"><MapPin size={10} /> {locationOffset === 0 ? 'Chittagong' : `Local: ${locationOffset > 0 ? '+' : ''}${locationOffset}m`}</div>
                <div className={`flex items-center gap-1 text-[10px] ${isSyncing ? 'text-amber-500 sync-pulse' : 'text-emerald-500'} font-bold`}>
-                 <Cloud size={10} /> {isSyncing ? 'SYNCING...' : 'CLOUD SYNCED'}
+                 <Cloud size={10} /> {isSyncing ? 'SYNCING...' : 'SUPABASE CONNECTED'}
                </div>
             </div>
           </div>
@@ -404,9 +382,9 @@ const App: React.FC = () => {
               <div>
                 <h2 className="text-xl font-black text-amber-400 uppercase tracking-widest flex items-center gap-2">
                   <Trophy size={20} className="text-amber-500" />
-                  Global Accountability Leaderboard
+                  Global Supabase Leaderboard
                 </h2>
-                <p className="text-sm text-emerald-500 italic">Scores are averaged based on days logged so far. Synced in real-time.</p>
+                <p className="text-sm text-emerald-500 italic">Synced globally via PostgreSQL Realtime.</p>
               </div>
             </div>
             <div className="overflow-x-auto">
@@ -422,37 +400,26 @@ const App: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-emerald-900/50">
-                  {sortedUsers.map(({ user, stats }, index) => {
-                    return (
-                      <tr key={user.id} className="group cursor-pointer hover:bg-emerald-900/30 transition-colors" onClick={() => setViewingUser(user)}>
-                        <td className="px-6 py-5">
-                          <span className={`text-sm font-black ${index === 0 ? 'text-amber-400' : index === 1 ? 'text-slate-300' : index === 2 ? 'text-amber-700' : 'text-emerald-700'}`}>
-                            #{index + 1}
-                          </span>
-                        </td>
-                        <td className="px-6 py-5">
-                          <div className="flex items-center gap-3">
-                            <div className="w-9 h-9 rounded-xl flex items-center justify-center font-black bg-emerald-800 text-emerald-100 group-hover:bg-amber-500 group-hover:text-emerald-950 transition-all">{user.name.charAt(0)}</div>
-                            <span className="font-bold group-hover:text-amber-400">{user.name}</span>
-                          </div>
-                        </td>
-                        <td className="px-6 py-5 text-center font-bold text-white">{stats.totalFastings}</td>
-                        <td className="px-6 py-5 text-center text-emerald-400">{stats.totalPrayers}</td>
-                        <td className="px-6 py-5 text-center text-blue-400">{stats.totalPages} <span className="text-[8px] uppercase">pgs</span></td>
-                        <td className="px-6 py-5 text-right">
-                          <div className="inline-flex flex-col items-end">
-                            <div className="w-24 h-2 bg-emerald-950 rounded-full overflow-hidden mb-1"><div className="h-full bg-amber-500" style={{ width: `${stats.overallProgress}%` }} /></div>
-                            <span className="text-[10px] font-black text-amber-500">{stats.overallProgress}% AVG</span>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                  {sortedUsers.length === 0 && (
-                    <tr>
-                      <td colSpan={6} className="px-6 py-20 text-center text-emerald-500 italic">Connecting to cloud database...</td>
+                  {sortedUsers.map(({ user, stats }, index) => (
+                    <tr key={user.id} className="group cursor-pointer hover:bg-emerald-900/30 transition-colors" onClick={() => setViewingUser(user)}>
+                      <td className="px-6 py-5"><span className={`text-sm font-black ${index === 0 ? 'text-amber-400' : index === 1 ? 'text-slate-300' : index === 2 ? 'text-amber-700' : 'text-emerald-700'}`}>#{index + 1}</span></td>
+                      <td className="px-6 py-5">
+                        <div className="flex items-center gap-3">
+                          <div className="w-9 h-9 rounded-xl flex items-center justify-center font-black bg-emerald-800 text-emerald-100 group-hover:bg-amber-500 group-hover:text-emerald-950 transition-all">{user.name.charAt(0)}</div>
+                          <span className="font-bold group-hover:text-amber-400">{user.name}</span>
+                        </div>
+                      </td>
+                      <td className="px-6 py-5 text-center font-bold text-white">{stats.totalFastings}</td>
+                      <td className="px-6 py-5 text-center text-emerald-400">{stats.totalPrayers}</td>
+                      <td className="px-6 py-5 text-center text-blue-400">{stats.totalPages} <span className="text-[8px] uppercase">pgs</span></td>
+                      <td className="px-6 py-5 text-right">
+                        <div className="inline-flex flex-col items-end">
+                          <div className="w-24 h-2 bg-emerald-950 rounded-full overflow-hidden mb-1"><div className="h-full bg-amber-500" style={{ width: `${stats.overallProgress}%` }} /></div>
+                          <span className="text-[10px] font-black text-amber-500">{stats.overallProgress}% AVG</span>
+                        </div>
+                      </td>
                     </tr>
-                  )}
+                  ))}
                 </tbody>
               </table>
             </div>
@@ -501,7 +468,7 @@ const App: React.FC = () => {
         <div className="flex flex-col items-center gap-6">
            <img src="https://placehold.co/150x150/022c22/fbbf24?text=AG&font=serif" alt="Atongko Group Logo" className="w-24 h-24 object-contain brightness-110 drop-shadow-2xl" />
            <p className="text-amber-400 font-black text-2xl">Powered by Atongko Group</p>
-           <p className="text-emerald-700 text-[10px] font-bold uppercase">Cloud Database Connected</p>
+           <p className="text-emerald-700 text-[10px] font-bold uppercase">PostgreSQL Global Sync</p>
         </div>
       </footer>
     </div>
