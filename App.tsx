@@ -51,39 +51,44 @@ const App: React.FC = () => {
   useEffect(() => {
     const initApp = async () => {
       setIsSyncing(true);
-      
-      // Check current auth session
-      const { data: { session } } = await supabase.auth.getSession();
-      
-      // Fetch initial leaderboard/users data
-      const { data, error } = await supabase
-        .from('users')
-        .select('*');
-      
-      if (error) {
-        console.error("Supabase Fetch Error:", error.message, error);
-        setIsConnected(false);
-      } else if (data) {
-        setIsConnected(true);
-        setAllUsers(data as UserProfile[]);
+      try {
+        // Check current auth session
+        const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) throw sessionError;
         
-        if (session?.user) {
-          const matchingUser = (data as UserProfile[]).find(u => u.id === session.user.id);
-          if (matchingUser) {
-            setCurrentUser(matchingUser);
-          } else {
-            // Handle case where auth exists but user doc doesn't (auto-create fallback)
-            const newUser: UserProfile = {
-              id: session.user.id,
-              name: session.user.user_metadata?.full_name || "New User",
-              isCurrentUser: true,
-              records: generateInitialRecords(),
-            };
-            setCurrentUser(newUser);
+        // Fetch initial leaderboard/users data
+        const { data, error: fetchError } = await supabase
+          .from('users')
+          .select('*');
+        
+        if (fetchError) {
+          // If table doesn't exist yet, we don't crash, we just log it
+          console.warn("Leaderboard table not found or accessible:", fetchError.message);
+          setIsConnected(false);
+        } else if (data) {
+          setIsConnected(true);
+          setAllUsers(data as UserProfile[]);
+          
+          if (session?.user) {
+            const matchingUser = (data as UserProfile[]).find(u => u.id === session.user.id);
+            if (matchingUser) {
+              setCurrentUser(matchingUser);
+            } else {
+              // Fallback if auth exists but no DB record (e.g. table deleted)
+              setCurrentUser({
+                id: session.user.id,
+                name: session.user.user_metadata?.full_name || "Guest User",
+                isCurrentUser: true,
+                records: generateInitialRecords(),
+              });
+            }
           }
         }
+      } catch (err) {
+        console.error("Initialization error:", err);
+      } finally {
+        setIsSyncing(false);
       }
-      setIsSyncing(false);
     };
 
     initApp();
@@ -136,7 +141,6 @@ const App: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
-  // Added dismissReminder function to handle UI dismissal of the daily report reminder
   const dismissReminder = () => {
     const now = new Date();
     sessionStorage.setItem(`dismissed_reminder_${now.toDateString()}`, 'true');
@@ -194,14 +198,21 @@ const App: React.FC = () => {
 
     try {
       // 1. Supabase Auth Sign Up
+      // Ensure your Supabase Dashboard has "Allow new users to sign up" enabled in Auth settings
       const { data: authData, error: authError } = await supabase.auth.signUp({
         email: getEmailFromUsername(nameInput),
         password: passwordInput,
-        options: { data: { full_name: nameInput.trim() } }
+        options: { 
+          data: { full_name: nameInput.trim() } 
+        }
       });
 
-      if (authError) throw authError;
-      if (!authData.user) throw new Error("Authentication failed to return a user.");
+      if (authError) {
+        console.error("Supabase Auth Registration Error:", authError.message, authError);
+        throw authError;
+      }
+      
+      if (!authData.user) throw new Error("Registration failed: No user object returned.");
 
       // 2. Create user record in 'users' table
       const newUser: UserProfile = {
@@ -211,18 +222,22 @@ const App: React.FC = () => {
         records: generateInitialRecords(),
       };
 
-      // We attempt the insert, but we won't block the user if the table isn't ready or exists.
+      // We attempt to save to the database but don't block the user if the table isn't created yet
       const { error: dbError } = await supabase.from('users').insert([newUser]);
       if (dbError) {
-        console.error("Supabase Database Insert Error:", dbError.message, dbError);
-        // We continue because the user is authenticated; local state will take over.
+        console.error("Leaderboard record could not be created:", dbError.message, dbError);
       }
 
       setCurrentUser(newUser);
       setNameInput(''); setPasswordInput('');
     } catch (err: any) {
-      console.error("Registration Exception:", err.message, err);
-      setLoginError(err.message || 'Registration failed.');
+      console.error("Registration Exception caught in App.tsx:", err.message, err);
+      // Provide helpful guidance for the "Email signups are disabled" error
+      if (err.message?.includes("disabled")) {
+        setLoginError("Signups are disabled in your Supabase Dashboard (Auth -> Providers -> Email).");
+      } else {
+        setLoginError(err.message || 'Registration failed.');
+      }
     }
   };
 
@@ -235,7 +250,10 @@ const App: React.FC = () => {
         password: passwordInput,
       });
 
-      if (authError) throw authError;
+      if (authError) {
+        console.error("Supabase Auth Login Error:", authError.message, authError);
+        throw authError;
+      }
       
       const { data: userData, error: dbError } = await supabase
         .from('users')
@@ -256,13 +274,17 @@ const App: React.FC = () => {
       }
       setNameInput(''); setPasswordInput('');
     } catch (err: any) {
-      console.error("Login Exception:", err.message, err);
+      console.error("Login Exception caught in App.tsx:", err.message, err);
       setLoginError(err.message || 'Login failed.');
     }
   };
 
   const handleLogout = async () => {
-    await supabase.auth.signOut();
+    try {
+      await supabase.auth.signOut();
+    } catch (err) {
+      console.error("Logout Error:", err);
+    }
     setCurrentUser(null); setViewingUser(null); setActiveTab('dashboard');
   };
 
@@ -276,7 +298,9 @@ const App: React.FC = () => {
       .update({ records: updatedRecords })
       .eq('id', currentUser.id);
     
-    if (error) console.error("Update Sync Error:", error.message, error);
+    if (error) {
+      console.error("Sync Error: Failed to update user record in database:", error.message, error);
+    }
   };
 
   const calculateStats = (user: UserProfile) => {
@@ -312,7 +336,7 @@ const App: React.FC = () => {
           </div>
           <form onSubmit={authMode === 'register' ? handleCreateProfile : handleLogin} className="space-y-4">
             <div className="space-y-1">
-              <label className="text-[10px] text-emerald-500 font-bold uppercase tracking-widest px-2">User Name</label>
+              <label className="text-[10px] text-emerald-500 font-bold uppercase tracking-widest px-2">Account Name</label>
               <input type="text" required value={nameInput} onChange={(e) => setNameInput(e.target.value)} placeholder="e.g. Abdullah" className="w-full bg-emerald-950/50 border border-emerald-800 rounded-xl px-4 py-3 text-emerald-50 outline-none focus:border-amber-500 transition-all" />
             </div>
             <div className="space-y-1">
@@ -350,14 +374,14 @@ const App: React.FC = () => {
               <div className="bg-emerald-950 text-amber-500 p-2 rounded-2xl animate-bounce"><BellRing size={24} /></div>
               <p className="text-sm font-bold">আজকের আমলনামা কি পূর্ণ করেছেন? রিপোর্ট সাবমিট করুন।</p>
             </div>
-            <button onClick={dismissReminder} className="p-2"><X size={20} /></button>
+            <button onClick={dismissReminder} className="p-2 hover:bg-emerald-950/10 rounded-full transition-colors"><X size={20} /></button>
           </div>
         </div>
       )}
 
       <div className="flex justify-between items-center py-6">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-amber-500 text-emerald-950 flex items-center justify-center font-black">{currentUser.name.charAt(0)}</div>
+          <div className="w-10 h-10 rounded-xl bg-amber-500 text-emerald-950 flex items-center justify-center font-black shadow-lg shadow-amber-500/20">{currentUser.name.charAt(0)}</div>
           <div className="flex flex-col">
             <span className="font-bold text-white leading-none">{currentUser.name}</span>
             <div className="flex items-center gap-2">
@@ -368,16 +392,16 @@ const App: React.FC = () => {
             </div>
           </div>
         </div>
-        <button onClick={handleLogout} className="p-2.5 rounded-xl glass border-emerald-800 text-emerald-400"><LogOut size={20} /></button>
+        <button onClick={handleLogout} className="p-2.5 rounded-xl glass border-emerald-800 text-emerald-400 hover:text-white transition-all"><LogOut size={20} /></button>
       </div>
 
       <Header />
 
       {countdownInfo && (
-        <div className="glass p-6 rounded-3xl border border-amber-500/20 mb-8 flex flex-col md:flex-row items-center justify-between gap-6 overflow-hidden relative">
+        <div className="glass p-6 rounded-3xl border border-amber-500/20 shadow-2xl mb-8 flex flex-col md:flex-row items-center justify-between gap-6 overflow-hidden relative">
           <div className="absolute top-0 right-0 p-4 opacity-10 pointer-events-none"><Timer size={100} className="text-amber-500" /></div>
           <div className="space-y-1 text-center md:text-left">
-            <h3 className="text-amber-500 font-black uppercase tracking-[0.3em] text-[10px]">Today</h3>
+            <h3 className="text-amber-500 font-black uppercase tracking-[0.3em] text-[10px]">Current Status</h3>
             <p className="text-white text-2xl font-bold">Ramadan Day {currentRamadanDay}</p>
             <div className="flex gap-4 pt-2">
               <div className="flex flex-col">
@@ -394,8 +418,8 @@ const App: React.FC = () => {
             <span className="text-emerald-400 font-black uppercase tracking-widest text-xs">{countdownInfo.label}</span>
             <div className="flex gap-2">
               {[ { val: countdownInfo.h, label: 'HRS' }, { val: countdownInfo.m, label: 'MIN' }, { val: countdownInfo.s, label: 'SEC' } ].map((t, idx) => (
-                <div key={idx} className="flex flex-col items-center glass bg-emerald-950/80 px-4 py-3 rounded-2xl min-w-[70px]">
-                  <span className="text-3xl font-black text-amber-500 font-mono">{t.val.toString().padStart(2, '0')}</span>
+                <div key={idx} className="flex flex-col items-center glass bg-emerald-950/80 px-4 py-3 rounded-2xl min-w-[70px] border border-amber-500/10">
+                  <span className="text-3xl font-black text-amber-500 font-mono leading-none">{t.val.toString().padStart(2, '0')}</span>
                 </div>
               ))}
             </div>
@@ -406,9 +430,9 @@ const App: React.FC = () => {
       <main className="mt-8 space-y-8">
         <MotivationalSection />
         <div className="flex justify-center p-1.5 bg-emerald-950/90 glass rounded-2xl w-fit mx-auto sticky top-4 z-40 border border-amber-500/20 backdrop-blur-xl">
-          <button onClick={() => { setActiveTab('dashboard'); setViewingUser(null); }} className={`flex items-center gap-2 px-6 py-3 rounded-xl transition-all ${activeTab === 'dashboard' && !viewingUser ? 'bg-amber-500 text-emerald-950 font-black' : 'text-emerald-300'}`}><LayoutDashboard size={20} /> <span className="hidden sm:inline">My Tracker</span></button>
-          <button onClick={() => { setActiveTab('group'); setViewingUser(null); }} className={`flex items-center gap-2 px-6 py-3 rounded-xl transition-all ${activeTab === 'group' || viewingUser ? 'bg-amber-500 text-emerald-950 font-black' : 'text-emerald-300'}`}><Users size={20} /> <span className="hidden sm:inline">Leaderboard</span></button>
-          <button onClick={() => { setActiveTab('schedule'); setViewingUser(null); }} className={`flex items-center gap-2 px-6 py-3 rounded-xl transition-all ${activeTab === 'schedule' ? 'bg-amber-500 text-emerald-950 font-black' : 'text-emerald-300'}`}><Clock size={20} /> <span className="hidden sm:inline">2026 Table</span></button>
+          <button onClick={() => { setActiveTab('dashboard'); setViewingUser(null); }} className={`flex items-center gap-2 px-6 py-3 rounded-xl transition-all ${activeTab === 'dashboard' && !viewingUser ? 'bg-amber-500 text-emerald-950 font-black' : 'text-emerald-300 hover:text-white'}`}><LayoutDashboard size={20} /> <span className="hidden sm:inline">My Tracker</span></button>
+          <button onClick={() => { setActiveTab('group'); setViewingUser(null); }} className={`flex items-center gap-2 px-6 py-3 rounded-xl transition-all ${activeTab === 'group' || viewingUser ? 'bg-amber-500 text-emerald-950 font-black' : 'text-emerald-300 hover:text-white'}`}><Users size={20} /> <span className="hidden sm:inline">Leaderboard</span></button>
+          <button onClick={() => { setActiveTab('schedule'); setViewingUser(null); }} className={`flex items-center gap-2 px-6 py-3 rounded-xl transition-all ${activeTab === 'schedule' ? 'bg-amber-500 text-emerald-950 font-black' : 'text-emerald-300 hover:text-white'}`}><Clock size={20} /> <span className="hidden sm:inline">2026 Table</span></button>
         </div>
 
         {activeTab === 'dashboard' && !viewingUser && (
@@ -439,9 +463,14 @@ const App: React.FC = () => {
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-left">
-                <thead className="bg-emerald-950/50 text-emerald-400 text-[10px] uppercase font-black"><tr className="px-6 py-4">
-                  <th className="px-6 py-4">Rank</th><th className="px-6 py-4">Name</th><th className="px-6 py-4 text-center">Fasts</th><th className="px-6 py-4 text-right">Progress</th>
-                </tr></thead>
+                <thead className="bg-emerald-950/50 text-emerald-400 text-[10px] uppercase font-black">
+                  <tr className="px-6 py-4">
+                    <th className="px-6 py-4">Rank</th>
+                    <th className="px-6 py-4">Name</th>
+                    <th className="px-6 py-4 text-center">Fasts</th>
+                    <th className="px-6 py-4 text-right">Progress</th>
+                  </tr>
+                </thead>
                 <tbody className="divide-y divide-emerald-900/50">
                   {sortedUsers.map(({ user, stats }, index) => (
                     <tr key={user.id} className="cursor-pointer hover:bg-emerald-900/30 transition-colors" onClick={() => setViewingUser(user)}>
@@ -451,6 +480,11 @@ const App: React.FC = () => {
                       <td className="px-6 py-5 text-right font-black text-amber-500">{stats.overallProgress}%</td>
                     </tr>
                   ))}
+                  {sortedUsers.length === 0 && (
+                    <tr>
+                      <td colSpan={4} className="px-6 py-12 text-center text-emerald-600 italic">No users found or table not yet active...</td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
             </div>
@@ -459,7 +493,7 @@ const App: React.FC = () => {
 
         {viewingUser && (
           <div className="space-y-8 animate-in fade-in">
-            <button onClick={() => setViewingUser(null)} className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-900/40 text-emerald-300"><ArrowLeft size={18} /> Back</button>
+            <button onClick={() => setViewingUser(null)} className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-900/40 text-emerald-300 border border-emerald-800 transition-colors hover:text-amber-400"><ArrowLeft size={18} /> Back</button>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
               {viewingUser.records.map(record => <DayCard key={record.day} record={record} onUpdate={() => {}} readOnly={true} />)}
             </div>
@@ -467,8 +501,8 @@ const App: React.FC = () => {
         )}
 
         {activeTab === 'schedule' && (
-          <div className="glass rounded-3xl overflow-hidden max-w-4xl mx-auto">
-            <div className="p-8 bg-emerald-900/50 flex justify-between">
+          <div className="glass rounded-3xl overflow-hidden max-w-4xl mx-auto animate-in fade-in">
+            <div className="p-8 bg-emerald-900/50 flex justify-between border-b border-amber-500/10">
               <h2 className="text-3xl font-black text-amber-400">Schedule</h2>
               <Calendar className="text-amber-400/20" size={60} />
             </div>
@@ -497,6 +531,7 @@ const App: React.FC = () => {
       <footer className="mt-20 pt-10 border-t border-emerald-900/50 text-center pb-10">
          <img src="https://placehold.co/150x150/022c22/fbbf24?text=AG&font=serif" alt="Logo" className="w-16 h-16 mx-auto mb-4 opacity-50" />
          <p className="text-amber-400 font-black">Powered by Atongko Group</p>
+         <p className="text-emerald-700 text-[10px] font-bold uppercase mt-1">PostgreSQL + Supabase Realtime</p>
       </footer>
     </div>
   );
