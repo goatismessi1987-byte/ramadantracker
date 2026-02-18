@@ -38,6 +38,13 @@
       0%, 100% { opacity: 1; }
       50% { opacity: .5; }
     }
+    .animate-spin-slow {
+      animation: spin 8s linear infinite;
+    }
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
   </style>
 <script type="importmap">
 {
@@ -48,15 +55,13 @@
     "react-dom/": "https://esm.sh/react-dom@^19.2.4/",
     "react-dom/client": "https://esm.sh/react-dom@^19.2.4/client",
     "@google/genai": "https://esm.sh/@google/genai@^1.41.0",
-    "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@^2.39.0",
-    "firebase/": "https://esm.sh/firebase@^12.9.0/"
+    "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@^2.39.0"
   }
 }
 </script>
 </head>
 <body class="text-emerald-50 islamic-pattern min-h-screen">
   <div id="root"></div>
-  <!-- Entry point -->
   <script type="module" src="index.tsx"></script>
 </body>
 </html>

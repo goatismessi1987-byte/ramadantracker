@@ -20,14 +20,16 @@ import {
   Timer, 
   X, 
   Trophy,
-  Cloud
+  Cloud,
+  CheckCircle,
+  AlertCircle
 } from 'lucide-react';
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'group' | 'schedule'>('dashboard');
   const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
   const [isSyncing, setIsSyncing] = useState(true);
-  
+  const [isConnected, setIsConnected] = useState(false);
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
   
   // Auth state
@@ -42,48 +44,64 @@ const App: React.FC = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [locationOffset, setLocationOffset] = useState(0);
 
-  // 1. Initial Load and Real-time Subscription via Supabase
+  // Helper to map username to a unique email for Supabase Auth
+  const getEmailFromUsername = (username: string) => `${username.toLowerCase().replace(/\s/g, '')}@ramadan.app`;
+
+  // 1. Initialize session and real-time listeners
   useEffect(() => {
-    const fetchInitialData = async () => {
+    const initApp = async () => {
+      setIsSyncing(true);
+      
+      // Check current auth session
+      const { data: { session } } = await supabase.auth.getSession();
+      
+      // Fetch initial leaderboard/users data
       const { data, error } = await supabase
         .from('users')
         .select('*');
       
-      if (!error && data) {
+      if (error) {
+        console.error("Supabase Fetch Error:", error.message, error);
+        setIsConnected(false);
+      } else if (data) {
+        setIsConnected(true);
         setAllUsers(data as UserProfile[]);
         
-        // Resolve Current User if ID exists in localStorage
-        const savedId = localStorage.getItem('ramadan_current_user_id');
-        if (savedId) {
-          const matchingUser = (data as UserProfile[]).find(u => u.id === savedId);
-          if (matchingUser) setCurrentUser(matchingUser);
+        if (session?.user) {
+          const matchingUser = (data as UserProfile[]).find(u => u.id === session.user.id);
+          if (matchingUser) {
+            setCurrentUser(matchingUser);
+          } else {
+            // Handle case where auth exists but user doc doesn't (auto-create fallback)
+            const newUser: UserProfile = {
+              id: session.user.id,
+              name: session.user.user_metadata?.full_name || "New User",
+              isCurrentUser: true,
+              records: generateInitialRecords(),
+            };
+            setCurrentUser(newUser);
+          }
         }
       }
       setIsSyncing(false);
     };
 
-    fetchInitialData();
+    initApp();
 
-    // Subscribe to changes
+    // Real-time listener for the "users" table
     const channel = supabase
-      .channel('schema-db-changes')
+      .channel('global-sync')
       .on(
         'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'users'
-        },
+        { event: '*', schema: 'public', table: 'users' },
         (payload) => {
           setAllUsers((prev) => {
             if (payload.eventType === 'INSERT') {
-              return [...prev, payload.new as UserProfile];
+              const newUser = payload.new as UserProfile;
+              return prev.some(u => u.id === newUser.id) ? prev : [...prev, newUser];
             } else if (payload.eventType === 'UPDATE') {
               const updated = payload.new as UserProfile;
-              // Sync current user state if they are the one being updated
-              if (localStorage.getItem('ramadan_current_user_id') === updated.id) {
-                setCurrentUser(updated);
-              }
+              if (currentUser?.id === updated.id) setCurrentUser(updated);
               return prev.map(u => u.id === updated.id ? updated : u);
             } else if (payload.eventType === 'DELETE') {
               return prev.filter(u => u.id === payload.old.id);
@@ -92,49 +110,45 @@ const App: React.FC = () => {
           });
         }
       )
-      .subscribe();
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') setIsConnected(true);
+      });
 
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, []);
+    return () => { supabase.removeChannel(channel); };
+  }, [currentUser?.id]);
 
-  // Clock & Countdown Timer
+  // Timer, Geolocation, and Reminders
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
     return () => clearInterval(timer);
   }, []);
 
-  // Reminder Logic
   useEffect(() => {
     const checkReminder = () => {
       const now = new Date();
       if (now.getHours() === 23 && now.getMinutes() >= 30) {
         const dismissedToday = sessionStorage.getItem(`dismissed_reminder_${now.toDateString()}`);
         if (!dismissedToday) setShowReminder(true);
-      } else {
-        setShowReminder(false);
-      }
+      } else setShowReminder(false);
     };
     checkReminder();
     const interval = setInterval(checkReminder, 30000);
     return () => clearInterval(interval);
   }, []);
 
+  // Added dismissReminder function to handle UI dismissal of the daily report reminder
   const dismissReminder = () => {
+    const now = new Date();
+    sessionStorage.setItem(`dismissed_reminder_${now.toDateString()}`, 'true');
     setShowReminder(false);
-    sessionStorage.setItem(`dismissed_reminder_${new Date().toDateString()}`, 'true');
   };
 
-  // Geolocation
   useEffect(() => {
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition((position) => {
         const { longitude } = position.coords;
-        const baseLng = 91.78; // Chittagong
-        const offset = Math.round((longitude - baseLng) * 4);
-        setLocationOffset(offset);
-      }, (err) => console.warn(err));
+        setLocationOffset(Math.round((longitude - 91.78) * 4));
+      }, (err) => console.warn("Geo access denied.", err));
     }
   }, []);
 
@@ -175,61 +189,99 @@ const App: React.FC = () => {
 
   const handleCreateProfile = async (e: React.FormEvent) => {
     e.preventDefault();
+    setLoginError('');
     if (!nameInput.trim() || !passwordInput.trim()) return;
-    if (allUsers.some(u => u.name.toLowerCase() === nameInput.toLowerCase())) {
-      setLoginError('This name is already taken.');
-      return;
-    }
-    const newId = crypto.randomUUID();
-    const newUser: UserProfile = {
-      id: newId,
-      name: nameInput.trim(),
-      password: passwordInput.trim(),
-      isCurrentUser: true,
-      records: generateInitialRecords(),
-    };
-    const { error } = await supabase.from('users').insert([newUser]);
-    if (error) {
-      setLoginError('Cloud registration failed.');
-    } else {
+
+    try {
+      // 1. Supabase Auth Sign Up
+      const { data: authData, error: authError } = await supabase.auth.signUp({
+        email: getEmailFromUsername(nameInput),
+        password: passwordInput,
+        options: { data: { full_name: nameInput.trim() } }
+      });
+
+      if (authError) throw authError;
+      if (!authData.user) throw new Error("Authentication failed to return a user.");
+
+      // 2. Create user record in 'users' table
+      const newUser: UserProfile = {
+        id: authData.user.id,
+        name: nameInput.trim(),
+        isCurrentUser: true,
+        records: generateInitialRecords(),
+      };
+
+      // We attempt the insert, but we won't block the user if the table isn't ready or exists.
+      const { error: dbError } = await supabase.from('users').insert([newUser]);
+      if (dbError) {
+        console.error("Supabase Database Insert Error:", dbError.message, dbError);
+        // We continue because the user is authenticated; local state will take over.
+      }
+
       setCurrentUser(newUser);
-      localStorage.setItem('ramadan_current_user_id', newId);
       setNameInput(''); setPasswordInput('');
+    } catch (err: any) {
+      console.error("Registration Exception:", err.message, err);
+      setLoginError(err.message || 'Registration failed.');
     }
   };
 
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    const user = allUsers.find(u => u.name.toLowerCase() === nameInput.toLowerCase() && u.password === passwordInput);
-    if (user) {
-      setCurrentUser(user);
-      localStorage.setItem('ramadan_current_user_id', user.id);
-      setNameInput(''); setPasswordInput(''); setLoginError('');
-    } else {
-      setLoginError('Invalid name or password.');
+    setLoginError('');
+    try {
+      const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+        email: getEmailFromUsername(nameInput),
+        password: passwordInput,
+      });
+
+      if (authError) throw authError;
+      
+      const { data: userData, error: dbError } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', authData.user.id)
+        .single();
+
+      if (!dbError && userData) {
+        setCurrentUser(userData as UserProfile);
+      } else {
+        // Fallback if record missing from DB but auth works
+        setCurrentUser({
+          id: authData.user.id,
+          name: nameInput,
+          isCurrentUser: true,
+          records: generateInitialRecords(),
+        });
+      }
+      setNameInput(''); setPasswordInput('');
+    } catch (err: any) {
+      console.error("Login Exception:", err.message, err);
+      setLoginError(err.message || 'Login failed.');
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
     setCurrentUser(null); setViewingUser(null); setActiveTab('dashboard');
-    localStorage.removeItem('ramadan_current_user_id');
   };
 
   const updateRecord = async (updatedRecord: DayRecord) => {
     if (!currentUser) return;
     const updatedRecords = currentUser.records.map(r => r.day === updatedRecord.day ? updatedRecord : r);
-    // Optimistic update
     setCurrentUser({ ...currentUser, records: updatedRecords });
+    
     const { error } = await supabase
       .from('users')
       .update({ records: updatedRecords })
       .eq('id', currentUser.id);
-    if (error) console.error("Supabase sync failed:", error);
+    
+    if (error) console.error("Update Sync Error:", error.message, error);
   };
 
   const calculateStats = (user: UserProfile) => {
     const totalFastings = user.records.filter(r => r.fasting).length;
-    const totalPages = user.records.reduce((acc, r) => acc + r.quranPages, 0);
+    const totalPages = user.records.reduce((acc, r) => acc + (r.quranPages || 0), 0);
     const totalPrayers = user.records.reduce((acc, r) => acc + Object.values(r.salah).filter(v => v).length, 0);
     const lastDayWithActivity = [...user.records].reverse().find(r => r.fasting || Object.values(r.salah).some(v => v) || r.quranPages > 0)?.day || 0;
     const activePeriod = Math.max(currentRamadanDay, lastDayWithActivity);
@@ -255,25 +307,33 @@ const App: React.FC = () => {
         <Header />
         <div className="w-full max-w-md glass p-8 rounded-3xl border border-amber-500/30 shadow-2xl space-y-6 animate-in fade-in zoom-in duration-500">
           <div className="flex bg-emerald-950/50 p-1 rounded-xl mb-6">
-            <button onClick={() => { setAuthMode('register'); setLoginError(''); }} className={`flex-1 py-2 rounded-lg text-sm font-bold transition-all ${authMode === 'register' ? 'bg-amber-500 text-emerald-950 shadow-md' : 'text-emerald-400'}`}>Create Account</button>
+            <button onClick={() => { setAuthMode('register'); setLoginError(''); }} className={`flex-1 py-2 rounded-lg text-sm font-bold transition-all ${authMode === 'register' ? 'bg-amber-500 text-emerald-950 shadow-md' : 'text-emerald-400'}`}>Register</button>
             <button onClick={() => { setAuthMode('login'); setLoginError(''); }} className={`flex-1 py-2 rounded-lg text-sm font-bold transition-all ${authMode === 'login' ? 'bg-amber-500 text-emerald-950 shadow-md' : 'text-emerald-400'}`}>Log In</button>
           </div>
           <form onSubmit={authMode === 'register' ? handleCreateProfile : handleLogin} className="space-y-4">
-            <input type="text" required value={nameInput} onChange={(e) => setNameInput(e.target.value)} placeholder="User Name" className="w-full bg-emerald-950/50 border border-emerald-800 rounded-xl px-4 py-3 text-emerald-50 outline-none focus:border-amber-500 transition-all" />
-            <input type="password" required value={passwordInput} onChange={(e) => setPasswordInput(e.target.value)} placeholder="Password" className="w-full bg-emerald-950/50 border border-emerald-800 rounded-xl px-4 py-3 text-emerald-50 outline-none focus:border-amber-500 transition-all" />
-            {loginError && <p className="text-red-400 text-xs text-center font-bold uppercase tracking-widest">{loginError}</p>}
+            <div className="space-y-1">
+              <label className="text-[10px] text-emerald-500 font-bold uppercase tracking-widest px-2">User Name</label>
+              <input type="text" required value={nameInput} onChange={(e) => setNameInput(e.target.value)} placeholder="e.g. Abdullah" className="w-full bg-emerald-950/50 border border-emerald-800 rounded-xl px-4 py-3 text-emerald-50 outline-none focus:border-amber-500 transition-all" />
+            </div>
+            <div className="space-y-1">
+              <label className="text-[10px] text-emerald-500 font-bold uppercase tracking-widest px-2">Password</label>
+              <input type="password" required value={passwordInput} onChange={(e) => setPasswordInput(e.target.value)} placeholder="••••••••" className="w-full bg-emerald-950/50 border border-emerald-800 rounded-xl px-4 py-3 text-emerald-50 outline-none focus:border-amber-500 transition-all" />
+            </div>
+            {loginError && (
+              <div className="bg-red-500/10 border border-red-500/20 p-3 rounded-xl flex items-start gap-2 animate-bounce">
+                <AlertCircle size={16} className="text-red-400 shrink-0 mt-0.5" />
+                <p className="text-red-400 text-xs font-bold leading-tight">{loginError}</p>
+              </div>
+            )}
             <button type="submit" className="w-full py-4 bg-amber-500 text-emerald-950 font-black rounded-xl flex items-center justify-center gap-2 hover:bg-amber-400 transition-all shadow-lg active:scale-95">
               {authMode === 'register' ? <UserPlus size={20} /> : <Key size={20} />}
-              {authMode === 'register' ? 'Join the Journey' : 'Log In'}
+              {authMode === 'register' ? 'Join Globally' : 'Access Profile'}
             </button>
           </form>
         </div>
         <div className="flex flex-col items-center gap-4 py-8 border-t border-emerald-900/50 w-full max-w-md">
            <img src="https://placehold.co/120x120/022c22/fbbf24?text=AG&font=serif" alt="Atongko Group Logo" className="w-20 h-20 object-contain drop-shadow-[0_0_10px_rgba(251,191,36,0.3)] opacity-80" />
-           <div className="text-center">
-             <p className="text-emerald-500 text-xs uppercase tracking-widest font-bold">Supabase Global Sync</p>
-             <p className="text-amber-400 font-bold text-lg">Powered by Atongko Group</p>
-           </div>
+           <p className="text-amber-400 font-bold text-lg">Powered by Atongko Group</p>
         </div>
       </div>
     );
@@ -285,42 +345,39 @@ const App: React.FC = () => {
     <div className="max-w-6xl mx-auto pb-32 px-4 relative">
       {showReminder && (
         <div className="fixed top-6 left-1/2 -translate-x-1/2 z-[60] w-[90%] max-w-lg animate-in fade-in slide-in-from-top-10 duration-500">
-          <div className="bg-gradient-to-r from-amber-600 to-amber-500 text-emerald-950 p-4 sm:p-5 rounded-3xl flex items-center justify-between gap-4 shadow-[0_20px_50px_-12px_rgba(251,191,36,0.5)] border-2 border-emerald-900/20">
+          <div className="bg-gradient-to-r from-amber-600 to-amber-500 text-emerald-950 p-4 sm:p-5 rounded-3xl flex items-center justify-between gap-4 shadow-2xl border-2 border-emerald-900/20">
             <div className="flex items-center gap-3">
               <div className="bg-emerald-950 text-amber-500 p-2 rounded-2xl animate-bounce"><BellRing size={24} /></div>
-              <div className="flex flex-col">
-                <span className="text-[10px] font-black uppercase tracking-[0.2em] opacity-80">Daily Reminder</span>
-                <p className="text-sm sm:text-base font-bold leading-tight">আজকের আমলনামা কি পূর্ণ করেছেন? আপনার রিপোর্ট সাবমিট করুন।</p>
-              </div>
+              <p className="text-sm font-bold">আজকের আমলনামা কি পূর্ণ করেছেন? রিপোর্ট সাবমিট করুন।</p>
             </div>
-            <button onClick={dismissReminder} className="p-2 hover:bg-emerald-950/10 rounded-full transition-colors"><X size={20} strokeWidth={3} /></button>
+            <button onClick={dismissReminder} className="p-2"><X size={20} /></button>
           </div>
         </div>
       )}
 
       <div className="flex justify-between items-center py-6">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-amber-500 text-emerald-950 flex items-center justify-center font-black shadow-lg shadow-amber-500/20">{currentUser.name.charAt(0)}</div>
+          <div className="w-10 h-10 rounded-xl bg-amber-500 text-emerald-950 flex items-center justify-center font-black">{currentUser.name.charAt(0)}</div>
           <div className="flex flex-col">
             <span className="font-bold text-white leading-none">{currentUser.name}</span>
             <div className="flex items-center gap-2">
                <div className="flex items-center gap-1 text-[10px] text-emerald-500 font-bold"><MapPin size={10} /> {locationOffset === 0 ? 'Chittagong' : `Local: ${locationOffset > 0 ? '+' : ''}${locationOffset}m`}</div>
-               <div className={`flex items-center gap-1 text-[10px] ${isSyncing ? 'text-amber-500 sync-pulse' : 'text-emerald-500'} font-bold`}>
-                 <Cloud size={10} /> {isSyncing ? 'SYNCING...' : 'SUPABASE CONNECTED'}
+               <div className={`flex items-center gap-1 text-[10px] ${isConnected ? 'text-emerald-500' : 'text-amber-500 sync-pulse'} font-bold`}>
+                 {isConnected ? <CheckCircle size={10} /> : <Cloud size={10} />} {isConnected ? 'GLOBAL SYNC ACTIVE' : 'RECONNECTING...'}
                </div>
             </div>
           </div>
         </div>
-        <button onClick={handleLogout} className="p-2.5 rounded-xl glass border-emerald-800 text-emerald-400 hover:text-white transition-all"><LogOut size={20} /></button>
+        <button onClick={handleLogout} className="p-2.5 rounded-xl glass border-emerald-800 text-emerald-400"><LogOut size={20} /></button>
       </div>
 
       <Header />
 
       {countdownInfo && (
-        <div className="glass p-6 rounded-3xl border border-amber-500/20 shadow-2xl mb-8 flex flex-col md:flex-row items-center justify-between gap-6 overflow-hidden relative">
+        <div className="glass p-6 rounded-3xl border border-amber-500/20 mb-8 flex flex-col md:flex-row items-center justify-between gap-6 overflow-hidden relative">
           <div className="absolute top-0 right-0 p-4 opacity-10 pointer-events-none"><Timer size={100} className="text-amber-500" /></div>
           <div className="space-y-1 text-center md:text-left">
-            <h3 className="text-amber-500 font-black uppercase tracking-[0.3em] text-[10px]">Current Status</h3>
+            <h3 className="text-amber-500 font-black uppercase tracking-[0.3em] text-[10px]">Today</h3>
             <p className="text-white text-2xl font-bold">Ramadan Day {currentRamadanDay}</p>
             <div className="flex gap-4 pt-2">
               <div className="flex flex-col">
@@ -337,9 +394,8 @@ const App: React.FC = () => {
             <span className="text-emerald-400 font-black uppercase tracking-widest text-xs">{countdownInfo.label}</span>
             <div className="flex gap-2">
               {[ { val: countdownInfo.h, label: 'HRS' }, { val: countdownInfo.m, label: 'MIN' }, { val: countdownInfo.s, label: 'SEC' } ].map((t, idx) => (
-                <div key={idx} className="flex flex-col items-center glass bg-emerald-950/80 px-4 py-3 rounded-2xl min-w-[70px] border border-amber-500/10">
-                  <span className="text-3xl font-black text-amber-500 font-mono leading-none">{t.val.toString().padStart(2, '0')}</span>
-                  <span className="text-[9px] text-emerald-600 font-bold mt-1">{t.label}</span>
+                <div key={idx} className="flex flex-col items-center glass bg-emerald-950/80 px-4 py-3 rounded-2xl min-w-[70px]">
+                  <span className="text-3xl font-black text-amber-500 font-mono">{t.val.toString().padStart(2, '0')}</span>
                 </div>
               ))}
             </div>
@@ -349,24 +405,24 @@ const App: React.FC = () => {
 
       <main className="mt-8 space-y-8">
         <MotivationalSection />
-        <div className="flex justify-center p-1.5 bg-emerald-950/90 glass rounded-2xl w-fit mx-auto sticky top-4 z-40 border border-amber-500/20 shadow-2xl backdrop-blur-xl">
-          <button onClick={() => { setActiveTab('dashboard'); setViewingUser(null); }} className={`flex items-center gap-2 px-6 py-3 rounded-xl transition-all ${activeTab === 'dashboard' && !viewingUser ? 'bg-amber-500 text-emerald-950 font-black' : 'text-emerald-300 hover:text-white'}`}><LayoutDashboard size={20} /> <span className="hidden sm:inline">My Tracker</span></button>
-          <button onClick={() => { setActiveTab('group'); setViewingUser(null); }} className={`flex items-center gap-2 px-6 py-3 rounded-xl transition-all ${activeTab === 'group' || viewingUser ? 'bg-amber-500 text-emerald-950 font-black' : 'text-emerald-300 hover:text-white'}`}><Users size={20} /> <span className="hidden sm:inline">Leaderboard</span></button>
-          <button onClick={() => { setActiveTab('schedule'); setViewingUser(null); }} className={`flex items-center gap-2 px-6 py-3 rounded-xl transition-all ${activeTab === 'schedule' ? 'bg-amber-500 text-emerald-950 font-black' : 'text-emerald-300 hover:text-white'}`}><Clock size={20} /> <span className="hidden sm:inline">2026 Table</span></button>
+        <div className="flex justify-center p-1.5 bg-emerald-950/90 glass rounded-2xl w-fit mx-auto sticky top-4 z-40 border border-amber-500/20 backdrop-blur-xl">
+          <button onClick={() => { setActiveTab('dashboard'); setViewingUser(null); }} className={`flex items-center gap-2 px-6 py-3 rounded-xl transition-all ${activeTab === 'dashboard' && !viewingUser ? 'bg-amber-500 text-emerald-950 font-black' : 'text-emerald-300'}`}><LayoutDashboard size={20} /> <span className="hidden sm:inline">My Tracker</span></button>
+          <button onClick={() => { setActiveTab('group'); setViewingUser(null); }} className={`flex items-center gap-2 px-6 py-3 rounded-xl transition-all ${activeTab === 'group' || viewingUser ? 'bg-amber-500 text-emerald-950 font-black' : 'text-emerald-300'}`}><Users size={20} /> <span className="hidden sm:inline">Leaderboard</span></button>
+          <button onClick={() => { setActiveTab('schedule'); setViewingUser(null); }} className={`flex items-center gap-2 px-6 py-3 rounded-xl transition-all ${activeTab === 'schedule' ? 'bg-amber-500 text-emerald-950 font-black' : 'text-emerald-300'}`}><Clock size={20} /> <span className="hidden sm:inline">2026 Table</span></button>
         </div>
 
         {activeTab === 'dashboard' && !viewingUser && (
-          <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
+          <div className="space-y-8 animate-in fade-in duration-700">
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-center">
               {[
-                { label: 'Monthly Score', val: `${currentStats.overallProgress}%`, border: 'border-amber-500' },
+                { label: 'Overall %', val: `${currentStats.overallProgress}%`, border: 'border-amber-500' },
                 { label: 'Total Fasts', val: currentStats.totalFastings, border: 'border-blue-500' },
-                { label: 'Total Prayers', val: currentStats.totalPrayers, border: 'border-emerald-500' },
+                { label: 'Prayers Done', val: currentStats.totalPrayers, border: 'border-emerald-500' },
                 { label: 'Quran Pages', val: currentStats.totalPages, border: 'border-purple-500' }
               ].map((stat, i) => (
                 <div key={i} className={`glass p-6 rounded-3xl border-b-4 ${stat.border}/30`}>
-                  <span className="text-amber-500 text-[10px] font-black uppercase tracking-[0.2em] mb-2 block">{stat.label}</span>
-                  <span className="text-5xl font-black text-white">{stat.val}</span>
+                  <span className="text-amber-500 text-[10px] font-black uppercase mb-2 block">{stat.label}</span>
+                  <span className="text-4xl font-black text-white">{stat.val}</span>
                 </div>
               ))}
             </div>
@@ -378,46 +434,21 @@ const App: React.FC = () => {
 
         {activeTab === 'group' && !viewingUser && (
           <div className="glass rounded-3xl overflow-hidden border border-emerald-800/50 animate-in fade-in duration-500">
-            <div className="p-6 border-b border-emerald-800/50 bg-emerald-900/20 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <div>
-                <h2 className="text-xl font-black text-amber-400 uppercase tracking-widest flex items-center gap-2">
-                  <Trophy size={20} className="text-amber-500" />
-                  Global Supabase Leaderboard
-                </h2>
-                <p className="text-sm text-emerald-500 italic">Synced globally via PostgreSQL Realtime.</p>
-              </div>
+            <div className="p-6 bg-emerald-900/20 border-b border-emerald-800/50">
+              <h2 className="text-xl font-black text-amber-400 flex items-center gap-2"><Trophy size={20} /> Global Leaders</h2>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-left">
-                <thead>
-                  <tr className="bg-emerald-950/50 text-emerald-400 text-[10px] font-black uppercase tracking-widest">
-                    <th className="px-6 py-4 w-16">Rank</th>
-                    <th className="px-6 py-4">Participant</th>
-                    <th className="px-6 py-4 text-center">Fasts</th>
-                    <th className="px-6 py-4 text-center">Prayers</th>
-                    <th className="px-6 py-4 text-center">Quran</th>
-                    <th className="px-6 py-4 text-right">Avg Performance</th>
-                  </tr>
-                </thead>
+                <thead className="bg-emerald-950/50 text-emerald-400 text-[10px] uppercase font-black"><tr className="px-6 py-4">
+                  <th className="px-6 py-4">Rank</th><th className="px-6 py-4">Name</th><th className="px-6 py-4 text-center">Fasts</th><th className="px-6 py-4 text-right">Progress</th>
+                </tr></thead>
                 <tbody className="divide-y divide-emerald-900/50">
                   {sortedUsers.map(({ user, stats }, index) => (
-                    <tr key={user.id} className="group cursor-pointer hover:bg-emerald-900/30 transition-colors" onClick={() => setViewingUser(user)}>
-                      <td className="px-6 py-5"><span className={`text-sm font-black ${index === 0 ? 'text-amber-400' : index === 1 ? 'text-slate-300' : index === 2 ? 'text-amber-700' : 'text-emerald-700'}`}>#{index + 1}</span></td>
-                      <td className="px-6 py-5">
-                        <div className="flex items-center gap-3">
-                          <div className="w-9 h-9 rounded-xl flex items-center justify-center font-black bg-emerald-800 text-emerald-100 group-hover:bg-amber-500 group-hover:text-emerald-950 transition-all">{user.name.charAt(0)}</div>
-                          <span className="font-bold group-hover:text-amber-400">{user.name}</span>
-                        </div>
-                      </td>
-                      <td className="px-6 py-5 text-center font-bold text-white">{stats.totalFastings}</td>
-                      <td className="px-6 py-5 text-center text-emerald-400">{stats.totalPrayers}</td>
-                      <td className="px-6 py-5 text-center text-blue-400">{stats.totalPages} <span className="text-[8px] uppercase">pgs</span></td>
-                      <td className="px-6 py-5 text-right">
-                        <div className="inline-flex flex-col items-end">
-                          <div className="w-24 h-2 bg-emerald-950 rounded-full overflow-hidden mb-1"><div className="h-full bg-amber-500" style={{ width: `${stats.overallProgress}%` }} /></div>
-                          <span className="text-[10px] font-black text-amber-500">{stats.overallProgress}% AVG</span>
-                        </div>
-                      </td>
+                    <tr key={user.id} className="cursor-pointer hover:bg-emerald-900/30 transition-colors" onClick={() => setViewingUser(user)}>
+                      <td className="px-6 py-5 font-black">#{index + 1}</td>
+                      <td className="px-6 py-5 font-bold">{user.name}</td>
+                      <td className="px-6 py-5 text-center">{stats.totalFastings}</td>
+                      <td className="px-6 py-5 text-right font-black text-amber-500">{stats.overallProgress}%</td>
                     </tr>
                   ))}
                 </tbody>
@@ -427,8 +458,8 @@ const App: React.FC = () => {
         )}
 
         {viewingUser && (
-          <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4">
-            <button onClick={() => setViewingUser(null)} className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-900/40 text-emerald-300 border border-emerald-800 transition-colors hover:text-amber-400"><ArrowLeft size={18} /> Back to Leaderboard</button>
+          <div className="space-y-8 animate-in fade-in">
+            <button onClick={() => setViewingUser(null)} className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-900/40 text-emerald-300"><ArrowLeft size={18} /> Back</button>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
               {viewingUser.records.map(record => <DayCard key={record.day} record={record} onUpdate={() => {}} readOnly={true} />)}
             </div>
@@ -436,40 +467,36 @@ const App: React.FC = () => {
         )}
 
         {activeTab === 'schedule' && (
-          <div className="glass rounded-3xl overflow-hidden border border-amber-500/20 max-w-4xl mx-auto animate-in fade-in">
-            <div className="p-8 bg-gradient-to-br from-emerald-900/50 to-emerald-950/50 flex items-center justify-between border-b border-amber-500/20">
-              <div><h2 className="text-3xl font-black text-amber-400">Chittagong Schedule</h2></div>
-              <Calendar className="text-amber-400/10" size={80} />
+          <div className="glass rounded-3xl overflow-hidden max-w-4xl mx-auto">
+            <div className="p-8 bg-emerald-900/50 flex justify-between">
+              <h2 className="text-3xl font-black text-amber-400">Schedule</h2>
+              <Calendar className="text-amber-400/20" size={60} />
             </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left">
-                <thead><tr className="bg-emerald-950 text-amber-500 text-[10px] font-black uppercase tracking-[0.2em]"><th className="px-8 py-5">Ramadan</th><th className="px-8 py-5">Date</th><th className="px-8 py-5 text-center">Seheri (End)</th><th className="px-8 py-5 text-center">Iftar (Start)</th></tr></thead>
-                <tbody className="divide-y divide-emerald-800/50">
-                  {RAMADAN_SCHEDULE.map((item) => {
-                    const seheri = new Date(item.seheriRaw); seheri.setMinutes(seheri.getMinutes() + locationOffset);
-                    const iftar = new Date(item.iftarRaw); iftar.setMinutes(iftar.getMinutes() + locationOffset);
-                    return (
-                      <tr key={item.day} className="hover:bg-emerald-900/30 transition-colors">
-                        <td className="px-8 py-5 font-black text-emerald-100">Day {item.day}</td>
-                        <td className="px-8 py-5 text-emerald-400">{item.date}</td>
-                        <td className="px-8 py-5 text-center text-lg font-mono font-black text-blue-300">{seheri.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true })}</td>
-                        <td className="px-8 py-5 text-center text-lg font-mono font-black text-amber-400">{iftar.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true })}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+            <table className="w-full">
+              <thead className="bg-emerald-950 text-amber-500 text-[10px] uppercase font-black"><tr className="px-8 py-4">
+                <th className="px-8 py-5">Day</th><th className="px-8 py-5 text-center">Seheri</th><th className="px-8 py-5 text-center">Iftar</th>
+              </tr></thead>
+              <tbody className="divide-y divide-emerald-800/50">
+                {RAMADAN_SCHEDULE.map((item) => {
+                  const seheri = new Date(item.seheriRaw); seheri.setMinutes(seheri.getMinutes() + locationOffset);
+                  const iftar = new Date(item.iftarRaw); iftar.setMinutes(iftar.getMinutes() + locationOffset);
+                  return (
+                    <tr key={item.day} className="hover:bg-emerald-900/30">
+                      <td className="px-8 py-5 font-black">Day {item.day}</td>
+                      <td className="px-8 py-5 text-center font-mono">{seheri.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true })}</td>
+                      <td className="px-8 py-5 text-center font-mono text-amber-400">{iftar.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true })}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         )}
       </main>
 
       <footer className="mt-20 pt-10 border-t border-emerald-900/50 text-center pb-10">
-        <div className="flex flex-col items-center gap-6">
-           <img src="https://placehold.co/150x150/022c22/fbbf24?text=AG&font=serif" alt="Atongko Group Logo" className="w-24 h-24 object-contain brightness-110 drop-shadow-2xl" />
-           <p className="text-amber-400 font-black text-2xl">Powered by Atongko Group</p>
-           <p className="text-emerald-700 text-[10px] font-bold uppercase">PostgreSQL Global Sync</p>
-        </div>
+         <img src="https://placehold.co/150x150/022c22/fbbf24?text=AG&font=serif" alt="Logo" className="w-16 h-16 mx-auto mb-4 opacity-50" />
+         <p className="text-amber-400 font-black">Powered by Atongko Group</p>
       </footer>
     </div>
   );
