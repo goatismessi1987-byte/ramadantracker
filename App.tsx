@@ -3,20 +3,42 @@ import React, { useState, useEffect, useMemo } from 'react';
 import Header from './components/Header';
 import MotivationalSection from './components/MotivationalSection';
 import DayCard from './components/DayCard';
-import { DayRecord, UserProfile, RamadanSchedule } from './types';
+import { DayRecord, UserProfile } from './types';
 import { generateInitialRecords, RAMADAN_SCHEDULE, RAMADAN_START_DATE } from './constants';
-import { Calendar, Users, LayoutDashboard, Clock, Info, BellRing, LogOut, UserPlus, Key, ArrowLeft, Eye, MapPin, Timer, X, Trophy } from 'lucide-react';
+import { db } from './firebase';
+import { 
+  collection, 
+  onSnapshot, 
+  doc, 
+  setDoc, 
+  updateDoc, 
+  query 
+} from "firebase/firestore";
+import { 
+  Calendar, 
+  Users, 
+  LayoutDashboard, 
+  Clock, 
+  BellRing, 
+  LogOut, 
+  UserPlus, 
+  Key, 
+  ArrowLeft, 
+  MapPin, 
+  Timer, 
+  X, 
+  Trophy,
+  Cloud
+} from 'lucide-react';
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'group' | 'schedule'>('dashboard');
-  const [allUsers, setAllUsers] = useState<UserProfile[]>(() => {
-    const saved = localStorage.getItem('ramadan_all_users');
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
+  const [isSyncing, setIsSyncing] = useState(true);
+  
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(() => {
     const savedId = localStorage.getItem('ramadan_current_user_id');
-    const users = JSON.parse(localStorage.getItem('ramadan_all_users') || '[]');
-    return users.find((u: UserProfile) => u.id === savedId) || null;
+    return null; // Start null, will resolve from Firestore
   });
   
   // Auth state
@@ -25,21 +47,35 @@ const App: React.FC = () => {
   const [passwordInput, setPasswordInput] = useState('');
   const [loginError, setLoginError] = useState('');
   
-  // Detailed view state
+  // UI state
   const [viewingUser, setViewingUser] = useState<UserProfile | null>(null);
   const [showReminder, setShowReminder] = useState(false);
   const [currentTime, setCurrentTime] = useState(new Date());
   const [locationOffset, setLocationOffset] = useState(0);
 
-  // Persistence
+  // 1. Real-time sync with Firestore
   useEffect(() => {
-    localStorage.setItem('ramadan_all_users', JSON.stringify(allUsers));
-    if (currentUser) {
-      localStorage.setItem('ramadan_current_user_id', currentUser.id);
-    } else {
-      localStorage.removeItem('ramadan_current_user_id');
-    }
-  }, [allUsers, currentUser]);
+    const q = query(collection(db, "users"));
+    const unsubscribe = onSnapshot(q, (querySnapshot) => {
+      const users: UserProfile[] = [];
+      querySnapshot.forEach((doc) => {
+        users.push(doc.data() as UserProfile);
+      });
+      setAllUsers(users);
+      setIsSyncing(false);
+      
+      // Keep currentUser in sync with the latest global data
+      const savedId = localStorage.getItem('ramadan_current_user_id');
+      if (savedId) {
+        const matchingUser = users.find(u => u.id === savedId);
+        if (matchingUser) {
+          setCurrentUser(matchingUser);
+        }
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
 
   // Clock & Countdown Timer
   useEffect(() => {
@@ -135,25 +171,31 @@ const App: React.FC = () => {
     };
   }, [currentRamadanDay, currentTime, locationOffset]);
 
-  const handleCreateProfile = (e: React.FormEvent) => {
+  const handleCreateProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!nameInput.trim() || !passwordInput.trim()) return;
     if (allUsers.some(u => u.name.toLowerCase() === nameInput.toLowerCase())) {
       setLoginError('This name is already taken.');
       return;
     }
+
+    const newId = crypto.randomUUID();
     const newUser: UserProfile = {
-      id: crypto.randomUUID(),
+      id: newId,
       name: nameInput.trim(),
       password: passwordInput.trim(),
       isCurrentUser: true,
       records: generateInitialRecords(),
     };
-    setAllUsers([...allUsers, newUser]);
-    setCurrentUser(newUser);
-    setNameInput('');
-    setPasswordInput('');
-    setLoginError('');
+
+    try {
+      await setDoc(doc(db, "users", newId), newUser);
+      setCurrentUser(newUser);
+      localStorage.setItem('ramadan_current_user_id', newId);
+      setNameInput(''); setPasswordInput(''); setLoginError('');
+    } catch (err) {
+      setLoginError('Failed to save profile to cloud.');
+    }
   };
 
   const handleLogin = (e: React.FormEvent) => {
@@ -163,6 +205,7 @@ const App: React.FC = () => {
     );
     if (user) {
       setCurrentUser(user);
+      localStorage.setItem('ramadan_current_user_id', user.id);
       setNameInput(''); setPasswordInput(''); setLoginError('');
     } else {
       setLoginError('Invalid name or password.');
@@ -173,16 +216,27 @@ const App: React.FC = () => {
     setCurrentUser(null);
     setViewingUser(null);
     setActiveTab('dashboard');
+    localStorage.removeItem('ramadan_current_user_id');
   };
 
-  const updateRecord = (updatedRecord: DayRecord) => {
+  const updateRecord = async (updatedRecord: DayRecord) => {
     if (!currentUser) return;
-    const updatedUser = {
-      ...currentUser,
-      records: currentUser.records.map(r => r.day === updatedRecord.day ? updatedRecord : r)
-    };
-    setCurrentUser(updatedUser);
-    setAllUsers(prev => prev.map(u => u.id === currentUser.id ? updatedUser : u));
+    
+    const updatedRecords = currentUser.records.map(r => 
+      r.day === updatedRecord.day ? updatedRecord : r
+    );
+
+    // Optimistically update UI
+    setCurrentUser({ ...currentUser, records: updatedRecords });
+
+    try {
+      const userRef = doc(db, "users", currentUser.id);
+      await updateDoc(userRef, {
+        records: updatedRecords
+      });
+    } catch (err) {
+      console.error("Cloud sync failed:", err);
+    }
   };
 
   const calculateStats = (user: UserProfile) => {
@@ -190,14 +244,11 @@ const App: React.FC = () => {
     const totalPages = user.records.reduce((acc, r) => acc + r.quranPages, 0);
     const totalPrayers = user.records.reduce((acc, r) => acc + Object.values(r.salah).filter(v => v).length, 0);
     
-    // Find the furthest day with activity to calculate average correctly even during testing
     const lastDayWithActivity = [...user.records].reverse().find(r => 
       r.fasting || Object.values(r.salah).some(v => v) || r.quranPages > 0
     )?.day || 0;
 
-    // Use whichever is greater: current day of month or furthest day logged
     const activePeriod = Math.max(currentRamadanDay, lastDayWithActivity);
-    
     const relevantRecords = user.records.slice(0, activePeriod);
     const totalDailyPercentagesSum = relevantRecords.reduce((acc, r) => {
       const prayersDone = Object.values(r.salah).filter(v => v).length;
@@ -212,7 +263,6 @@ const App: React.FC = () => {
     return { totalFastings, totalPages, totalPrayers, overallProgress };
   };
 
-  // Memoized sorted users for the leaderboard
   const sortedUsers = useMemo(() => {
     return [...allUsers]
       .map(user => ({ user, stats: calculateStats(user) }))
@@ -241,7 +291,7 @@ const App: React.FC = () => {
         <div className="flex flex-col items-center gap-4 py-8 border-t border-emerald-900/50 w-full max-w-md">
            <img src="https://placehold.co/120x120/022c22/fbbf24?text=AG&font=serif" alt="Atongko Group Logo" className="w-20 h-20 object-contain drop-shadow-[0_0_10px_rgba(251,191,36,0.3)] opacity-80" />
            <div className="text-center">
-             <p className="text-emerald-500 text-xs uppercase tracking-widest font-bold">App Builder</p>
+             <p className="text-emerald-500 text-xs uppercase tracking-widest font-bold">Cloud Sync Active</p>
              <p className="text-amber-400 font-bold text-lg">Powered by Atongko Group</p>
            </div>
         </div>
@@ -275,7 +325,12 @@ const App: React.FC = () => {
           <div className="w-10 h-10 rounded-xl bg-amber-500 text-emerald-950 flex items-center justify-center font-black shadow-lg shadow-amber-500/20">{currentUser.name.charAt(0)}</div>
           <div className="flex flex-col">
             <span className="font-bold text-white leading-none">{currentUser.name}</span>
-            <div className="flex items-center gap-1 text-[10px] text-emerald-500 font-bold"><MapPin size={10} /> {locationOffset === 0 ? 'Chittagong' : `Local Offset: ${locationOffset > 0 ? '+' : ''}${locationOffset}m`}</div>
+            <div className="flex items-center gap-2">
+               <div className="flex items-center gap-1 text-[10px] text-emerald-500 font-bold"><MapPin size={10} /> {locationOffset === 0 ? 'Chittagong' : `Local: ${locationOffset > 0 ? '+' : ''}${locationOffset}m`}</div>
+               <div className={`flex items-center gap-1 text-[10px] ${isSyncing ? 'text-amber-500 sync-pulse' : 'text-emerald-500'} font-bold`}>
+                 <Cloud size={10} /> {isSyncing ? 'SYNCING...' : 'CLOUD SYNCED'}
+               </div>
+            </div>
           </div>
         </div>
         <button onClick={handleLogout} className="p-2.5 rounded-xl glass border-emerald-800 text-emerald-400 hover:text-white transition-all"><LogOut size={20} /></button>
@@ -349,9 +404,9 @@ const App: React.FC = () => {
               <div>
                 <h2 className="text-xl font-black text-amber-400 uppercase tracking-widest flex items-center gap-2">
                   <Trophy size={20} className="text-amber-500" />
-                  Accountability Leaderboard
+                  Global Accountability Leaderboard
                 </h2>
-                <p className="text-sm text-emerald-500 italic">Ranked by highest average performance % across active days.</p>
+                <p className="text-sm text-emerald-500 italic">Scores are averaged based on days logged so far. Synced in real-time.</p>
               </div>
             </div>
             <div className="overflow-x-auto">
@@ -395,7 +450,7 @@ const App: React.FC = () => {
                   })}
                   {sortedUsers.length === 0 && (
                     <tr>
-                      <td colSpan={6} className="px-6 py-20 text-center text-emerald-500 italic">No participants yet. Create a profile to start!</td>
+                      <td colSpan={6} className="px-6 py-20 text-center text-emerald-500 italic">Connecting to cloud database...</td>
                     </tr>
                   )}
                 </tbody>
@@ -446,6 +501,7 @@ const App: React.FC = () => {
         <div className="flex flex-col items-center gap-6">
            <img src="https://placehold.co/150x150/022c22/fbbf24?text=AG&font=serif" alt="Atongko Group Logo" className="w-24 h-24 object-contain brightness-110 drop-shadow-2xl" />
            <p className="text-amber-400 font-black text-2xl">Powered by Atongko Group</p>
+           <p className="text-emerald-700 text-[10px] font-bold uppercase">Cloud Database Connected</p>
         </div>
       </footer>
     </div>
