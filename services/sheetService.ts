@@ -4,14 +4,22 @@ import { UserProfile, DayRecord } from "../types";
 const SHEET_API_URL = "https://sheetdb.io/api/v1/kftdyehurnhwz";
 
 export const sheetService = {
-  // Fetch all users for the Leaderboard
+  // Fetch all users from the sheet
   async getAllUsers(): Promise<UserProfile[]> {
     try {
       const response = await fetch(SHEET_API_URL);
+      if (!response.ok) throw new Error("Network response was not ok");
       const data = await response.json();
+      
+      // Ensure data is an array and parse the nested records JSON
+      if (!Array.isArray(data)) return [];
+      
       return data.map((row: any) => ({
-        ...row,
-        records: JSON.parse(row.records)
+        id: row.id,
+        name: row.name,
+        password: row.password,
+        records: row.records ? JSON.parse(row.records) : [],
+        isCurrentUser: false
       }));
     } catch (error) {
       console.error("Failed to fetch users from SheetDB:", error);
@@ -19,25 +27,7 @@ export const sheetService = {
     }
   },
 
-  // Search for a specific user by name (Login)
-  async findUserByName(name: string): Promise<UserProfile | null> {
-    try {
-      const response = await fetch(`${SHEET_API_URL}/search?name=${encodeURIComponent(name)}`);
-      const data = await response.json();
-      if (data && data.length > 0) {
-        return {
-          ...data[0],
-          records: JSON.parse(data[0].records)
-        };
-      }
-      return null;
-    } catch (error) {
-      console.error("Login fetch failed:", error);
-      return null;
-    }
-  },
-
-  // Register a new user
+  // Register a new user with password
   async registerUser(user: UserProfile): Promise<boolean> {
     try {
       const payload = {
@@ -50,7 +40,10 @@ export const sheetService = {
       };
       const response = await fetch(SHEET_API_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
         body: JSON.stringify(payload)
       });
       return response.ok;
@@ -60,12 +53,15 @@ export const sheetService = {
     }
   },
 
-  // Update user records (Sync)
+  // Sync user records to the sheet
   async syncUserRecords(userId: string, records: DayRecord[]): Promise<boolean> {
     try {
       const response = await fetch(`${SHEET_API_URL}/id/${userId}`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
         body: JSON.stringify({
           data: {
             records: JSON.stringify(records)

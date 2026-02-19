@@ -46,19 +46,22 @@ const App: React.FC = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [locationOffset, setLocationOffset] = useState(0);
 
-  // 1. Check for active session on mount
+  // 1. Restore session on mount
   useEffect(() => {
     const savedUser = localStorage.getItem(ACTIVE_USER_KEY);
     if (savedUser) {
       try {
-        setCurrentUser(JSON.parse(savedUser));
+        const parsed = JSON.parse(savedUser);
+        if (parsed && parsed.id) {
+          setCurrentUser(parsed);
+        }
       } catch (e) {
         console.error("Session restoration failed", e);
       }
     }
   }, []);
 
-  // Timer and Reminders
+  // Timer for countdown and reminders
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
     return () => clearInterval(timer);
@@ -73,7 +76,7 @@ const App: React.FC = () => {
       } else setShowReminder(false);
     };
     checkReminder();
-    const interval = setInterval(checkReminder, 30000);
+    const interval = setInterval(checkReminder, 60000);
     return () => clearInterval(interval);
   }, []);
 
@@ -85,7 +88,7 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // Fetch Leaderboard when tab changes
+  // Sync leaderboard when the tab is visited
   useEffect(() => {
     if (activeTab === 'leaderboard') {
       const fetchLB = async () => {
@@ -109,22 +112,26 @@ const App: React.FC = () => {
     setAuthError('');
     setIsLoading(true);
     
-    if (!nameInput.trim() || !passwordInput.trim()) {
+    const trimmedName = nameInput.trim();
+    if (!trimmedName || !passwordInput.trim()) {
+      setAuthError('Please enter both name and password.');
       setIsLoading(false);
       return;
     }
 
-    // Check if user exists
-    const existing = await sheetService.findUserByName(nameInput.trim());
+    // Check if user already exists
+    const allUsers = await sheetService.getAllUsers();
+    const existing = allUsers.find(u => u.name.toLowerCase() === trimmedName.toLowerCase());
+    
     if (existing) {
-      setAuthError('This name is already taken. Please choose another or login.');
+      setAuthError('This name is already taken. Please choose another or sign in.');
       setIsLoading(false);
       return;
     }
 
     const newUser: UserProfile = {
       id: crypto.randomUUID(),
-      name: nameInput.trim(),
+      name: trimmedName,
       password: passwordInput,
       isCurrentUser: true,
       records: generateInitialRecords(),
@@ -136,7 +143,7 @@ const App: React.FC = () => {
       localStorage.setItem(ACTIVE_USER_KEY, JSON.stringify(newUser));
       resetForm();
     } else {
-      setAuthError('Cloud registration failed. Check your connection.');
+      setAuthError('Cloud registration failed. Please try again.');
     }
     setIsLoading(false);
   };
@@ -146,13 +153,21 @@ const App: React.FC = () => {
     setAuthError('');
     setIsLoading(true);
 
-    const user = await sheetService.findUserByName(nameInput.trim());
-    if (user && user.password === passwordInput) {
+    const trimmedName = nameInput.trim();
+    const allUsers = await sheetService.getAllUsers();
+    
+    // Search for user matching name and password
+    const user = allUsers.find(u => 
+      u.name.toLowerCase() === trimmedName.toLowerCase() && 
+      u.password === passwordInput
+    );
+
+    if (user) {
       setCurrentUser(user);
       localStorage.setItem(ACTIVE_USER_KEY, JSON.stringify(user));
       resetForm();
     } else {
-      setAuthError('Incorrect name or password.');
+      setAuthError('Invalid account name or password. Please try again.');
     }
     setIsLoading(false);
   };
@@ -172,15 +187,18 @@ const App: React.FC = () => {
   const updateRecord = async (updatedRecord: DayRecord) => {
     if (!currentUser) return;
     
-    // Optimistic Update
+    // Update local state first (Optimistic)
     const updatedRecords = currentUser.records.map(r => r.day === updatedRecord.day ? updatedRecord : r);
     const updatedUser = { ...currentUser, records: updatedRecords };
     setCurrentUser(updatedUser);
     localStorage.setItem(ACTIVE_USER_KEY, JSON.stringify(updatedUser));
 
-    // Sync to Cloud
+    // Async cloud sync
     setIsSyncing(true);
-    await sheetService.syncUserRecords(currentUser.id, updatedRecords);
+    const success = await sheetService.syncUserRecords(currentUser.id, updatedRecords);
+    if (!success) {
+      console.error("Cloud sync failed. Data is saved on this device only.");
+    }
     setIsSyncing(false);
   };
 
@@ -271,7 +289,7 @@ const App: React.FC = () => {
             <form onSubmit={authMode === 'register' ? handleRegister : handleLogin} className="space-y-4">
               <div className="flex items-center gap-2 text-amber-400 mb-2">
                 <button type="button" onClick={() => setAuthMode('welcome')} className="p-2 hover:bg-emerald-900 rounded-lg"><ArrowLeft size={18} /></button>
-                <span className="font-black uppercase tracking-widest text-sm">{authMode === 'register' ? 'Create Account' : 'Welcome Back'}</span>
+                <span className="font-black uppercase tracking-widest text-sm">{authMode === 'register' ? 'Register Account' : 'Welcome Back'}</span>
               </div>
               <div className="space-y-1">
                 <label className="text-[10px] text-emerald-500 font-bold uppercase tracking-widest px-2">Account Name</label>
@@ -284,13 +302,13 @@ const App: React.FC = () => {
               {authError && <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400 text-xs font-bold flex gap-2"><AlertCircle size={14} /> {authError}</div>}
               <button disabled={isLoading} type="submit" className="w-full py-4 bg-amber-500 text-emerald-950 font-black rounded-xl hover:bg-amber-400 shadow-lg active:scale-95 transition-all flex items-center justify-center gap-2">
                 {isLoading && <Loader2 className="animate-spin" size={20} />}
-                {authMode === 'register' ? 'Register Account' : 'Sign In'}
+                {authMode === 'register' ? 'Create Profile' : 'Sign In'}
               </button>
             </form>
           )}
 
           <div className="pt-4 border-t border-emerald-800/50 text-center">
-            <p className="text-[10px] text-emerald-600 font-bold uppercase tracking-widest flex items-center justify-center gap-1"><ShieldCheck size={10} /> Secure Cloud Storage Active</p>
+            <p className="text-[10px] text-emerald-600 font-bold uppercase tracking-widest flex items-center justify-center gap-1"><ShieldCheck size={10} /> Secure Private Storage Active</p>
           </div>
         </div>
       </div>
@@ -436,7 +454,7 @@ const App: React.FC = () => {
               </table>
             </div>
             <div className="p-4 bg-emerald-950/50 text-center text-[10px] text-emerald-600 font-bold uppercase tracking-widest border-t border-emerald-800/50">
-              * Rankings include all members across the globe.
+              * Rankings include all members using this tracker.
             </div>
           </div>
         )}
@@ -472,7 +490,7 @@ const App: React.FC = () => {
       <footer className="mt-20 pt-10 border-t border-emerald-900/50 text-center pb-10">
          <img src="https://placehold.co/150x150/022c22/fbbf24?text=AG&font=serif" alt="Logo" className="w-16 h-16 mx-auto mb-4 opacity-50" />
          <p className="text-amber-400 font-black">Powered by Atongko Group</p>
-         <p className="text-emerald-700 text-[10px] font-bold uppercase mt-1">Multi-User Secure Cloud Sync Active</p>
+         <p className="text-emerald-700 text-[10px] font-bold uppercase mt-1">Private Secure Cloud Data Storage Active</p>
       </footer>
     </div>
   );
