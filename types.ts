@@ -18,7 +18,7 @@ export interface DayRecord {
 export interface UserProfile {
   id: string;
   name: string;
-  password?: string; // Added password field
+  password?: string; // Added for local protection
   isCurrentUser: boolean;
   records: DayRecord[];
 }
@@ -35,7 +35,6 @@ export interface RamadanSchedule {
   date: string;
   seheri: string;
   iftar: string;
-  // Added raw Date objects to facilitate countdown and timezone calculations
   seheriRaw: Date;
   iftarRaw: Date;
 }
